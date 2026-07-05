@@ -150,3 +150,108 @@ X-RateLimit-Reset: 1718200860   (unix timestamp when window resets)
 | Throttle options | Drop, 429, or Message Queue |
 | Failure mode | Fail open (most APIs) vs fail closed (financial) |
 | Rules storage | Rate Limiter config/DB — not Redis |
+# Rate Limiter
+
+Source: Alex Xu, System Design Interview Vol 1, Chapter 4.
+
+## Why Rate Limiting
+
+- Prevent Denial of Service (DoS) attacks
+- Reduce costs (fewer requests to third-party APIs means lower bills)
+- Prevent servers from being overloaded
+
+## Where to Put the Rate Limiter
+
+Typically placed in the API Gateway layer.
+The gateway sits between clients and backend services.
+Every request passes through it before reaching any backend.
+
+Client-side rate limiting is not reliable — clients can be modified.
+Server-side is the correct approach.
+
+## Algorithms
+
+### Token Bucket
+
+A bucket holds tokens up to a maximum capacity.
+Tokens are added at a fixed rate.
+Each request consumes one token.
+If the bucket is empty the request is rejected.
+Allows bursts up to the bucket size.
+
+### Leaking Bucket
+
+Requests enter a queue (the bucket).
+Requests are processed at a fixed outflow rate.
+If the queue is full incoming requests are dropped.
+Smooths traffic. No bursts.
+
+### Fixed Window Counter
+
+Time is divided into fixed windows (e.g. 0-60s, 60-120s).
+A counter tracks requests per window.
+Counter resets at the start of each new window.
+Simple to implement. Weakness: spike at window boundary.
+
+### Sliding Window Log
+
+Keeps a log of request timestamps.
+On each request, remove timestamps older than the window.
+Count remaining timestamps. If over the limit, reject.
+More accurate than fixed window. Higher memory usage.
+
+### Sliding Window Counter
+
+Hybrid of fixed window and sliding window log.
+Uses a weighted count from the previous window and current window.
+More accurate than fixed window. Less memory than sliding window log.
+
+## Single Server vs Distributed
+
+On a single server rate limiting is straightforward.
+One Redis instance, one counter per user.
+
+In a distributed environment with multiple servers and multiple rate limiter instances, two problems arise:
+
+Race condition: two servers read the same counter simultaneously, both allow the request, counter increments twice.
+Solved with atomic operations (Redis INCR) or Lua scripts.
+
+Synchronisation: each rate limiter has its own state.
+If user requests hit different servers they may bypass the limit.
+Solved by using a centralised data store (Redis) that all rate limiter instances read and write to.
+
+## Performance Optimisation
+
+Cache rules in memory locally on each rate limiter.
+Reduce round trips to the rules database.
+Refresh the cache periodically.
+
+## Multi Data Centre
+
+Route users to the nearest data centre.
+Each data centre has its own Redis cluster.
+Use eventual consistency to synchronise counters across data centres.
+
+Eventual consistency means the total count across all data centres may temporarily exceed the limit during synchronisation delay.
+This is an acceptable trade-off for most use cases.
+
+## Synchronisation with Eventual Consistency
+
+When running rate limiters across multiple data centres, counters are synchronised using eventual consistency.
+The data will converge to the correct state but may be briefly out of sync.
+
+## Monitoring
+
+Track:
+- How often the rate limit is being hit (by endpoint, by user, by tier)
+- Whether the chosen algorithm is appropriate (too many false rejections?)
+- Whether the rules are correctly configured (limits too tight or too loose?)
+
+Monitoring tells you whether to adjust limits or change algorithms.
+
+## Hard and Soft Rate Limiting
+
+Hard rate limiting: requests exceeding the threshold are always rejected. No exceptions.
+
+Soft rate limiting: requests can exceed the threshold by a small margin for a short period.
+Useful for handling burst traffic without immediately rejecting legitimate users.
