@@ -375,3 +375,4 @@ With it: channels are isolated, workers scale independently, failures are contai
 
 Every component downstream of the queue is stateless and replaceable.
 The queue is the buffer between what you promise (deliver this notification) and what the world gives you (flaky providers, rate limits, network failures).
+

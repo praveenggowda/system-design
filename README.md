@@ -14,6 +14,8 @@ Folders with full mock interview Q&A:
 | [Payment System](./payment-system/) | Payment state machine, Saga pattern, idempotency, rail connectors, 202 Accepted |
 | [Event Processor](./event-processor/) | Outbox pattern, SNS fan-out to SQS, at-least-once delivery, idempotent consumers, DLQ |
 | [Real-Time Balance](./real-time-balance/) | Redis pub/sub cache invalidation, Write Primary reads, pre-computed balance table, CP |
+| [Metrics and Logging](./metrics-and-logging/) | Kafka, Elasticsearch, InfluxDB, Grafana, Kibana, S3 cold storage, backpressure, tiered retention |
+| [Webhook Delivery](./webhook-delivery/) | SQS, DynamoDB registry, PostgreSQL status tracking, exponential backoff, at-least-once delivery, SELECT FOR UPDATE |
 
 ## Study Designs
 
@@ -21,7 +23,7 @@ Folders from Alex Xu System Design Interview (Vol 1 & 2):
 
 | System | Key Concepts |
 |---|---|
-| [Notification System](./notification-system/) | Kafka, SQS, Outbox Pattern, Circuit Breaker, DLQ, Push/Email/SMS |
+| [Notification System](./notification-system/) | SQS, SNS fan-out, Outbox Pattern, Redis idempotency, Priority queues, DLQ, Push/Email/SMS — two variants |
 | [Rate Limiter](./rate-limiter/) | Fixed Window, Sliding Window, Redis INCR + TTL, fail open vs fail closed |
 | [URL Shortener](./url-shortener/) | DynamoDB, Redis LRU cache, Base62 encoding, redirect flow |
 | [Chat System](./chat-system/) | WebSocket, Redis Pub/Sub, multi-server routing, PostgreSQL, Push Notifications |
@@ -36,9 +38,13 @@ Folders from Alex Xu System Design Interview (Vol 1 & 2):
 | [Interview Framework](./interview-prep/system-design-interview-framework.md) | Clarify, back of envelope, high level, deep dive, failure handling |
 | [Pattern Library](./interview-prep/system-design-pattern-library.md) | Common patterns with when to use and trade-offs |
 
+## All Topics
+
+A full index of every concept covered — storage, messaging, consistency, caching, API design, observability, and more: [TOPICS.md](./TOPICS.md)
+
 ## Tools
 
-Diagrams created with [draw.io](https://app.diagrams.net).
+Diagrams created with [draw.io](https://app.diagrams.net) and [Excalidraw](https://excalidraw.com).
 
 ## About
 
