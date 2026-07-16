@@ -1,12 +1,10 @@
 # System Design
 
-System design diagrams and interview practice covering distributed systems, scalability and real-world architecture patterns.
+A collection of distributed system designs covering real-world architecture patterns, scalability, reliability and consistency.
 
-Each folder contains a `PROBLEM.md` (the design prompt), a draw.io diagram, and an `interview-qa.md` where available (mock interview Q&A with gaps identified).
+Each folder contains a problem statement, architecture notes, and a diagram.
 
-## Interview Practice
-
-Folders with full mock interview Q&A:
+## Designs
 
 | System | Key Concepts |
 |---|---|
@@ -16,27 +14,20 @@ Folders with full mock interview Q&A:
 | [Real-Time Balance](./real-time-balance/) | Redis pub/sub cache invalidation, Write Primary reads, pre-computed balance table, CP |
 | [Metrics and Logging](./metrics-and-logging/) | Kafka, Elasticsearch, InfluxDB, Grafana, Kibana, S3 cold storage, backpressure, tiered retention |
 | [Webhook Delivery](./webhook-delivery/) | SQS, DynamoDB registry, PostgreSQL status tracking, exponential backoff, at-least-once delivery, SELECT FOR UPDATE |
-
-## Study Designs
-
-Folders from Alex Xu System Design Interview (Vol 1 & 2):
-
-| System | Key Concepts |
-|---|---|
 | [Notification System](./notification-system/) | SQS, SNS fan-out, Outbox Pattern, Redis idempotency, Priority queues, DLQ, Push/Email/SMS — two variants |
+| [Automation System](./automation-system/) | Kafka, DynamoDB rule store, Redis cache, idempotency, SNS fan-out, SQS per service, time-based scheduler, DLQ, audit trail |
 | [Rate Limiter](./rate-limiter/) | Fixed Window, Sliding Window, Redis INCR + TTL, fail open vs fail closed |
 | [URL Shortener](./url-shortener/) | DynamoDB, Redis LRU cache, Base62 encoding, redirect flow |
 | [Chat System](./chat-system/) | WebSocket, Redis Pub/Sub, multi-server routing, PostgreSQL, Push Notifications |
 | [News Feed](./news-feed/) | Fan-out on write vs read, Redis cache, pagination |
 | [Booking System](./booking-system/) | Distributed locking, idempotency, seat reservation, race conditions |
 
-## Reference
+## Patterns
 
 | Resource | Topics |
 |---|---|
-| [Banking Concepts Q&A](./interview-prep/banking-concepts-qa.md) | Double-entry, idempotency, Saga, event sourcing, CQRS, outbox, CAP, API design, observability |
-| [Interview Framework](./interview-prep/system-design-interview-framework.md) | Clarify, back of envelope, high level, deep dive, failure handling |
 | [Pattern Library](./interview-prep/system-design-pattern-library.md) | Common patterns with when to use and trade-offs |
+| [Banking Concepts](./interview-prep/banking-concepts-qa.md) | Double-entry, idempotency, Saga, event sourcing, CQRS, outbox, CAP, API design, observability |
 
 ## All Topics
 
