@@ -16,6 +16,7 @@ Each folder contains a problem statement, architecture notes, and a diagram.
 | [Webhook Delivery](./webhook-delivery/) | SQS, DynamoDB registry, PostgreSQL status tracking, exponential backoff, at-least-once delivery, SELECT FOR UPDATE |
 | [Notification System](./notification-system/) | SQS, SNS fan-out, Outbox Pattern, Redis idempotency, Priority queues, DLQ, Push/Email/SMS — two variants |
 | [Automation System](./automation-system/) | Kafka, DynamoDB rule store, Redis cache, idempotency, SNS fan-out, SQS per service, time-based scheduler, DLQ, audit trail |
+| [Item Reordering](./item-reordering/) | Gap-based integers, optimistic locking, version number, Redis Pub/Sub, WebSockets, real-time fan-out, conflict resolution, optimistic UI |
 | [Rate Limiter](./rate-limiter/) | Fixed Window, Sliding Window, Redis INCR + TTL, fail open vs fail closed |
 | [URL Shortener](./url-shortener/) | DynamoDB, Redis LRU cache, Base62 encoding, redirect flow |
 | [Chat System](./chat-system/) | WebSocket, Redis Pub/Sub, multi-server routing, PostgreSQL, Push Notifications |

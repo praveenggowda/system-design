@@ -4,12 +4,12 @@
 
 ## Clarifications
 
-- Triggers are board events (status changed, item created, item moved) and time-based (due date arrives)
-- Automation effect does not need to be instant — 2 to 5 seconds acceptable
-- Idempotency required — same event must not fire the same automation twice
+- Triggers: board events (status changed, item created, item moved) and time-based (due date arrives)
+- 2 to 5 seconds execution latency acceptable
+- One event can match multiple automation rules
+- Idempotency required — same event must not execute the same automation rule twice
 - Audit trail required — 6 months retention
-- Notification delivery (email, push, in-app) is handled by a separate notification service — not in scope
-- One event can match multiple automation rules on the same board
+- Notification delivery (email, push, in-app) handled by a separate Notification Service
 - Scope: 3 trigger types, 3 action types
 
 ---
@@ -22,152 +22,265 @@
 | Peak throughput | 50,000 events/sec |
 | Daily volume | 864M events/day |
 | Per-event size | ~1KB |
-| Daily storage | ~864GB/day |
-| 6-month retention | ~157TB |
-| With one read replica | ~315TB |
+| Daily raw event storage | ~864GB/day |
+| 6-month raw event storage | ~157TB |
+
+Note: this is raw incoming event volume. Only events matching automation rules generate execution records. For accurate audit storage, ask for the automation match rate and average matched rules per event.
 
 ---
 
 ## High-Level Architecture
 
 ```
-Board Service / User Action
-        ↓
-      Kafka
-  (partitioned by BoardId)
-        ↓
-  Automation Engine
-  (consumes Kafka, matches rules)
-        ↓
-       SNS
-        ↓
-  ┌─────┬──────────────┬────────────────┐
-  SQS   SQS            SQS
-  │     │              │
-  Task  Notification   Audit Trail
-  Performer  Service   Service
-  │
-  Board Service API
-  (assign user / move item)
+Users
+  ↓
+Board Service
+  ↓
+Kafka: BoardEvents (key = BoardId)
+  ↓
+Automation Engine [AE1 ... AEN]
+  ├── Redis Rule Cache
+  └── DynamoDB Rule Store
+  ↓
+Durable Execution Record (EventId + RuleId)
+  ↓
+Transactional Outbox
+  ↓
+Outbox Publisher
+  ↓
+SNS
+  ├── Task SQS → Task Worker → Board API
+  ├── Notification SQS → Notification Worker → Notification Service
+  └── Audit SQS → Audit Worker → Execution Store
+
+Scheduler → Kafka (time-based triggers, same pipeline)
+
+CloudWatch / Datadog (Kafka lag, SQS depth, DLQ depth, latency, error rate)
 ```
 
 ---
 
 ## Kafka — Partitioning
 
-Partition key: **BoardId**
+**Default partition key: BoardId**
 
-All events for a given board land on the same partition, preserving ordering within the board.
+Events for the same board go to the same partition, preserving board-level ordering.
 
-Hot partition risk: if a single board is extremely active, that partition becomes a bottleneck. Mitigation: use a composite key such as `boardId + itemId` for high-traffic boards.
+**Hot partition risk:** an extremely active board overloads one partition.
 
-Kafka provides at-least-once delivery. Idempotency layer handles deduplication.
+**Alternative: BoardId + ItemId**
+
+Better distribution and parallelism. Loses board-level ordering, keeps item-level ordering.
+
+**Interview answer:**
+"The partition key should reflect the required ordering boundary. If ordering is required across the full board I use BoardId. If ordering is only required per item I use BoardId + ItemId for greater parallelism, accepting that board-level ordering is lost."
+
+**Scaling limit:** maximum useful consumer parallelism in one consumer group equals the partition count. 10 partitions = at most 10 actively consuming consumers. Scale partitions when adding consumers.
 
 ---
 
-## Rule Store — DynamoDB
+## Rule Store — DynamoDB + Redis Cache
 
-Rules are stored in DynamoDB.
+DynamoDB is the durable rule store.
 
-Key: `boardId`
-Value: JSON array of automation rules configured for that board
+Access pattern — prefer BoardId + TriggerType as the key:
 
-Example rule document:
-```json
-{
-  "boardId": "board-123",
-  "rules": [
-    {
-      "ruleId": "rule-abc",
-      "trigger": { "type": "STATUS_CHANGED", "toStatus": "Done" },
-      "action": { "type": "NOTIFY", "userId": "user-456" }
-    }
-  ]
-}
+```
+PK: BOARD#123
+SK: TRIGGER#STATUS_CHANGED#RULE#456
 ```
 
-**Redis cache sits in front of DynamoDB.** The Automation Engine checks Redis first. On cache miss, it fetches from DynamoDB and populates the cache.
+Redis caches rules per board per trigger type:
 
-Cache invalidation: when a user creates, updates, or deletes an automation rule, the cache for that boardId is invalidated or updated immediately.
+```
+Cache key: rules:{BoardId}:{TriggerType}
+Example:   rules:123:STATUS_CHANGED
+```
+
+Flow:
+
+```
+Automation Engine
+  ↓
+Redis (cache hit → evaluate rules)
+  ↓ (cache miss)
+DynamoDB → populate Redis → evaluate rules
+```
+
+On rule create, update, or delete: invalidate or update the relevant cache entry immediately.
+
+**Important:** Redis is a performance layer, not a correctness layer. Do not rely on Redis alone for durable idempotency. Redis can be evicted or restarted.
 
 ---
 
-## Idempotency — Redis
+## Idempotency — EventId + RuleId
 
-Before processing an event, the Automation Engine checks Redis using the Kafka message ID as the idempotency key.
+One event can match multiple rules. Using EventId alone as the idempotency key is wrong.
 
-- Key exists → already processed → skip
-- Key does not exist → process and write key to Redis with TTL (24 hours)
+**Correct idempotency boundary: EventId + RuleId**
 
-Prevents duplicate automation execution on retry.
+```
+Event E1 matches R1, R2, R3
+
+Idempotency keys:
+  E1:R1
+  E1:R2
+  E1:R3
+```
+
+Redis provides fast idempotency check:
+
+```
+Key: automation:idempotency:{eventId}:{ruleId}
+TTL: 24 hours
+```
+
+But Redis should not be the only mechanism — use durable execution records for correctness.
+
+---
+
+## Durable Execution Records
+
+Create a durable execution record for every matched rule before publishing any action.
+
+```sql
+automation_executions (
+  execution_id   UUID PRIMARY KEY,
+  event_id       UUID NOT NULL,
+  rule_id        UUID NOT NULL,
+  board_id       UUID NOT NULL,
+  action_type    VARCHAR NOT NULL,
+  status         VARCHAR NOT NULL,  -- MATCHED, CREATED, DISPATCHED, PROCESSING, SUCCEEDED, FAILED
+  failure_reason TEXT,
+  created_at     TIMESTAMPTZ,
+  updated_at     TIMESTAMPTZ,
+  UNIQUE(event_id, rule_id)
+)
+```
+
+If Kafka redelivers an event, the UNIQUE constraint prevents creating duplicate executions. The existing record is detected and the duplicate is skipped.
+
+**Audit trail:** this table IS the audit trail. Track lifecycle:
+
+```
+MATCHED → CREATED → DISPATCHED → PROCESSING → SUCCEEDED / FAILED
+```
+
+When a customer says an automation did not fire:
+- No execution record → investigate upstream (event generation, Kafka, rule matching)
+- Execution exists, incomplete → investigate downstream (worker, action execution)
+- Status FAILED → inspect failure reason and DLQ
+
+---
+
+## Kafka Offset Commit Strategy
+
+Precise statement:
+
+"The consumer pipeline is configured for at-least-once processing. The Automation Engine commits the Kafka offset only after successfully creating durable execution records."
+
+Failure scenario:
+
+```
+Consume E1
+Match R1, R2
+Create E1:R1, E1:R2
+★ Crash before offset commit
+Kafka redelivers E1
+E1:R1 and E1:R2 already exist → skip duplicates
+```
+
+This guarantees at-least-once processing with durable idempotency preventing duplicate execution.
+
+---
+
+## Transactional Outbox
+
+Dual-write problem: Automation Engine writes execution record to DB, then crashes before publishing to SNS. Action is lost.
+
+Solution: write execution record and outbox event atomically in one transaction.
+
+```sql
+BEGIN TRANSACTION
+  INSERT INTO automation_executions (execution_id, event_id, rule_id, status, ...)
+  INSERT INTO outbox (event_type, payload)
+COMMIT
+```
+
+Outbox Publisher reads unpublished outbox events and publishes to SNS. If SNS is unavailable, events remain in the outbox and are retried. If the publisher crashes, another instance continues.
+
+**Interview strategy:** do not draw the Outbox immediately. Introduce it when asked "what happens if the Automation Engine crashes between saving state and publishing the action?"
 
 ---
 
 ## SNS Fan-out → SQS per Service
 
-After the Automation Engine matches rules and determines required actions, it publishes to SNS.
-
 SNS fans out to a dedicated SQS queue per downstream service:
 
-- Task Performer SQS — handles assign user, move item to Overdue
-- Notification SQS — handles notify manager/user (delivers to notification service)
-- Audit Trail SQS — handles writing execution history
+- Task SQS → Task Worker → Board API (assign user, move item)
+- Notification SQS → Notification Worker → Notification Service
+- Audit SQS → Audit Worker → Execution Store
 
-Each service polls its own SQS queue independently. This gives each service independent retry control, DLQ, and consumption rate.
+Benefits: independent scaling, independent retry, independent DLQ, failure isolation. Notification slowness does not block Task or Audit processing.
+
+**Visibility timeout:** set comfortably longer than expected processing time. If processing takes 10 seconds, set to 30 to 60 seconds.
+
+**Retry → DLQ:** after max receive attempts (e.g. 3), message moves to DLQ. CloudWatch alarm on DLQ depth > 0. On-call investigates, fixes, redrives.
 
 ---
 
-## Failure Handling
+## Downstream Worker Idempotency
 
-SQS visibility timeout: **30 to 60 seconds** — must be longer than the maximum expected processing time per message.
+Workers must also be idempotent. SQS delivers at-least-once.
 
-If a consumer fails to process and does not delete the message, SQS makes the message visible again after the visibility timeout expires.
+Example: Task Worker moves item to Overdue, then crashes before deleting the SQS message. SQS redelivers.
 
-After max retries (e.g. 3), the message moves to a **Dead Letter Queue (DLQ)**.
-
-A CloudWatch alarm fires on DLQ depth > 0. On-call engineer investigates root cause, fixes the issue, and redrives messages from DLQ back to the main queue.
+Use ExecutionId or ActionId as the downstream idempotency key. If already executed: acknowledge and skip. Otherwise: execute the action.
 
 ---
 
 ## Time-Based Trigger — Scheduler
 
-"WHEN a due date arrives" is not triggered by a user action. It requires a dedicated scheduler.
-
-**Approach:**
-
-A dedicated `scheduled_events` table stores items with a due date:
-
-```
-scheduled_events
-  item_id       (PK)
-  board_id
-  due_date      (indexed)
-```
-
-An index on `due_date` allows efficient range queries.
-
-The scheduler runs on a short interval (e.g. every minute) and queries:
+"WHEN a due date arrives" is not triggered by a user action. Requires a dedicated Scheduler.
 
 ```sql
-SELECT * FROM scheduled_events
-WHERE due_date BETWEEN now AND now + INTERVAL '1 minute'
+scheduled_events (
+  scheduled_event_id   UUID PRIMARY KEY,
+  item_id              UUID NOT NULL,
+  board_id             UUID NOT NULL,
+  due_date             TIMESTAMPTZ NOT NULL,   -- indexed
+  status               VARCHAR NOT NULL
+)
+
+CREATE INDEX idx_due_date ON scheduled_events (due_date) WHERE status = 'PENDING';
 ```
 
-Matching items are published as events to Kafka, entering the same pipeline as board events.
+Scheduler periodically queries due events and publishes DueDateReached events to Kafka. Same Automation Engine pipeline handles them identically to board events.
 
-The scheduler reads from the **read replica** — never from the write database.
+**Read replica and replication lag:** using a read replica for scheduler queries is good for scale, but replication lag can make newly created due dates temporarily invisible.
+
+Mitigation: use overlapping query windows.
+
+Example: scheduler at 10:01 queries due dates from 09:59 to 10:02. Duplicates are acceptable because EventId + RuleId idempotency prevents duplicate execution.
+
+**Interview answer:** "I use a read replica to offload scheduler queries where slight replication lag is acceptable. I use overlapping query windows to prevent missed events, and idempotent processing to handle duplicates safely."
 
 ---
 
-## Audit Trail
+## Failure Scenarios
 
-The Audit Trail Service subscribes to SNS via its own SQS queue and writes an execution record for every automation that fires.
-
-Record includes: boardId, ruleId, triggering event, action taken, timestamp, result (success/failure).
-
-Retention: 6 months. After 6 months, records are deleted or archived to cold storage (e.g. S3).
-
-**The audit trail is the first diagnostic tool when an automation is reported as not firing.** Check whether a record exists. If yes, problem is downstream. If no, problem is upstream.
+| Failure | Behaviour |
+|---|---|
+| Kafka redelivers same event | EventId + RuleId unique constraint prevents duplicate execution |
+| Automation Engine crashes before offset commit | Kafka redelivers; existing execution record skips duplicate |
+| Crash between DB write and SNS publish | Transactional Outbox retains event; publisher retries |
+| Redis is down | Fall back to DynamoDB for rule lookup; do not rely on Redis for durable idempotency |
+| Task Worker executes action, crashes before SQS delete | SQS redelivers; ExecutionId idempotency prevents duplicate side effect |
+| Notification Service is down | Notification SQS backs up; Task and Audit continue independently |
+| Scheduled event selected twice | ScheduledEventId + RuleId idempotency prevents duplicate execution |
+| Read replica replication lag | Overlapping scheduler windows + idempotency covers the gap |
+| Hot board partition | Consider BoardId + ItemId partition key, accepting loss of board-level ordering |
+| Kafka consumer lag increases | Scale consumers up to partition count; scale partitions if needed |
 
 ---
 
@@ -175,15 +288,50 @@ Retention: 6 months. After 6 months, records are deleted or archived to cold sto
 
 | Signal | What to monitor |
 |---|---|
-| Kafka consumer lag | Automation Engine falling behind |
-| SQS queue depth | Downstream services backing up |
-| DLQ depth | Failed messages requiring investigation |
+| Kafka consumer lag | Automation Engine backlog, autoscaling signal |
+| SQS queue depth | Downstream backlog |
+| DLQ depth > 0 | Failed messages requiring investigation |
 | Redis hit/miss ratio | Cache effectiveness |
-| Automation execution rate | Drop may indicate upstream event failure |
+| Automation execution rate | Unexpected drop = upstream event failure |
+| Automation execution latency | Verify 2 to 5 second target |
+| Error rate | Detect failures across pipeline |
 
-Logs: structured logs with boardId, ruleId, eventId, and trace ID on every event.
+Structured logs: every log entry includes BoardId, RuleId, EventId, ExecutionId, TraceId.
 
-Traces: distributed tracing across Kafka → Automation Engine → SNS → SQS → downstream services.
+Distributed trace: Board Service → Kafka → Automation Engine → Outbox → SNS → SQS → Worker.
+
+---
+
+## Interview Presentation Strategy
+
+**Do not start with every advanced component.**
+
+Start with:
+
+```
+Board Service → Kafka → Automation Engine → SNS → SQS → Workers
+```
+
+Then add:
+- DynamoDB rule store
+- Redis cache
+- Scheduler for time-based triggers
+
+Then discuss:
+- Partitioning trade-off (BoardId vs BoardId + ItemId)
+- Scaling (consumer count vs partition count)
+- Rule matching
+
+When asked about duplicates:
+→ Introduce EventId + RuleId idempotency
+
+When asked about durable correctness:
+→ Introduce durable Automation Execution records
+
+When asked about crashing between DB write and publishing:
+→ Introduce Transactional Outbox
+
+This demonstrates the ability to evolve the architecture based on requirements rather than over-engineering upfront.
 
 ---
 
@@ -191,17 +339,21 @@ Traces: distributed tracing across Kafka → Automation Engine → SNS → SQS �
 
 | Decision | Why | Alternative |
 |---|---|---|
-| Kafka over SQS for ingestion | High throughput, replay, partitioning by BoardId | SQS — simpler but no replay, weaker ordering |
-| DynamoDB for rule store | O(1) lookup by boardId, scales well | PostgreSQL — relational but slower for this key-value pattern |
-| Redis cache for rules | Avoid DynamoDB read on every event at 10K RPS | No cache — DynamoDB can handle it but at higher cost and latency |
-| SNS fan-out to SQS per service | Independent retry, DLQ, consumption rate per service | Single shared queue — simpler but no isolation |
-| Dedicated scheduler for due dates | Efficient indexed query, decoupled from board events | DynamoDB TTL streams — elegant but less control over timing precision |
+| Kafka over SQS for ingestion | High throughput, replay, partition-based ordering, consumer groups | SQS — simpler but no replay, weaker ordering |
+| DynamoDB for rule store | Scalable, efficient known-key access patterns | PostgreSQL — relational but slower for this key-value pattern |
+| Redis cache for rules | Low-latency, reduces DynamoDB reads at 10K RPS | No cache — DynamoDB can handle it but at higher cost and latency |
+| EventId + RuleId idempotency | One event can match multiple rules; EventId alone is insufficient | EventId only — causes duplicate actions for multi-rule events |
+| Durable execution records | Stronger than Redis idempotency alone; full audit trail | Redis only — eviction or restart loses idempotency |
+| Transactional Outbox | Prevents lost SNS events on crash between DB write and publish | Direct publish — event lost if process crashes mid-flight |
+| SNS fan-out to SQS per service | Independent retry, DLQ, consumption rate per service | Single shared queue — simpler but no failure isolation |
+| Dedicated Scheduler for due dates | Efficient indexed query, same Kafka pipeline | DynamoDB TTL streams — elegant but less timing control |
+| BoardId partition key | Board-level ordering | BoardId + ItemId — better distribution, loses board ordering |
 
 ---
 
 ## Diagram
 
-See `automation-system.excalidraw` — draw manually in Excalidraw.
+See `automation-system.excalidraw`.
 
 Components to include:
 - Board Service / User Action
@@ -209,11 +361,14 @@ Components to include:
 - Automation Engine (with Redis cache + DynamoDB rule store)
 - Redis (idempotency + rule cache)
 - DynamoDB (rule store)
+- Durable Execution Store (PostgreSQL)
+- Transactional Outbox
+- Outbox Publisher
 - SNS
-- SQS per service (Task Performer, Notification, Audit Trail)
-- Task Performer → Board Service API
-- Notification Service
-- Audit Trail DB
-- DLQ
+- SQS per service (Task, Notification, Audit)
+- Task Worker → Board Service API
+- Notification Worker → Notification Service
+- Audit Worker → Execution Store
+- DLQ for each queue
 - Scheduler (with scheduled_events table + read replica)
-- CloudWatch / Alerting
+- CloudWatch / Datadog
