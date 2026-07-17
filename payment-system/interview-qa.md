@@ -1,144 +1,227 @@
-# Payment Platform — Interview Q&A
-
-> Live mock interview session. Questions asked by interviewer, answers given and gaps filled.
+# Payment System — Interview Q&A
 
 ---
 
-## Requirements Gathering
+## Clarifications
 
-**Q: Design a Payment Processing Platform.**
-
-Clarifying questions asked:
-- Is this credit card, loan, mortgage, or account-to-account transfer?
-- How many TPS at peak?
-- How many registered users and DAU?
-- Domestic or international payments?
-- What is the SLA for payment completion?
-
-Answers given:
-- Scope: account-to-account transfers (UK domestic)
-- Peak TPS: 50,000
-- Registered: 100M, DAU: 10M
-- Domestic only — UK Faster Payments
-- SLA: real-time, payment completes within 10 seconds
-
-**Two questions missed during requirements gathering:**
-1. Domestic or international? — huge design impact (SWIFT vs Faster Payments)
-2. What is the payment SLA? — determines sync vs async processing
-
----
-
-## Difference: Banking Ledger vs Payment Platform
-
-- Banking Ledger — records what happened. Source of truth. Answers "what is my balance?"
-- Payment Platform — orchestrates the movement of money. Handles validation, compliance, routing, failure. Writes to the ledger once confirmed.
-- Payment Platform is upstream of the Ledger. They connect at the point where a confirmed payment creates a ledger entry.
-
----
-
-## Functional Requirements
-
-- Process payment from account A to account B
-- Validate payment request — account exists, sufficient balance
-- Check for duplicate payments (idempotency)
-- Return payment status to the caller
-- Write confirmed payment to the ledger
-
----
-
-## Non-Functional Requirements
-
-- Consistency over availability — CP
-- SLA: payment completes within 10 seconds
-- Idempotency — same payment processed only once
-- Durability — zero data loss, at-least-once delivery
-- Scale: 50,000 TPS peak, 100MB/sec write throughput
-- Availability SLO: 99.99%
-- Security — authentication, authorisation, fraud detection
+- Operations: POST /payment (send money), GET /payment/{id} (status check)
+- Payment is asynchronous — return 202 Accepted immediately, process in background
+- User sees status as PENDING on submission, polls or receives notification on completion
+- Idempotency required — accidental duplicate submission must not charge twice
+- No balance check in scope — a separate Banking Ledger handles balances
+- Single currency for now
+- Auth handled by a separate identity service — not in scope
 
 ---
 
 ## Back of Envelope
 
-- Peak TPS: 50,000 / Average TPS: 5,000
-- Daily volume: 5,000 * 86,400 = 432M transactions/day
-- User sanity check: 432M / 10M DAU = 43 transactions per user per day
-- Storage: 432M * 2KB (double-entry) = 864GB/day → 315TB/year → 945TB with 3 replicas
-- Write throughput at peak: 50,000 * 2KB = 100MB/sec
-- Implication: sharding required
+```
+100K seconds shortcut:
 
-**Gap corrected:** Original calculation wrote 4.3M instead of 432M — missed the full seconds in a day (86,400 not 86.4).
+Average: 1,000 TPS × 100K = 100M payments/day  (storage sizing)
+Peak:    5,000 TPS × 100K = 500M payments/day  (infrastructure sizing)
 
-**Indian to Western conversion:**
-- 1 Lakh = 0.1 Million
-- 1 Crore = 10 Million
-- Always convert to Million/Billion immediately in the interview
+Storage: 2KB × 100M = 200GB/day
+         200GB × 365 ≈ 70TB/year
+         × 7 years = 490TB
+         × 3 replicas = ~1.5PB → tier: 90 days hot, rest cold (S3 Glacier)
 
----
-
-## High Level Design Q&A
-
-**Q: Where does the payment request come from — upstream system or client directly?**
-Client sends POST /payments directly. Request contains source_account_id, destination_account_id, amount, currency, idempotency_key in header.
-
-**Q: Walk me through the full payment flow.**
-
-Answer:
-- Load Balancer → API Gateway (auth, rate limiting)
-- Check idempotency key in Redis — if exists return cached response
-- Fetch pre-computed balance from Read Replica — validate account active and balance sufficient
-- If valid, publish message to SQS — return 202 Accepted + payment_id immediately
-- Payment Worker polls SQS → passes to Saga Coordinator
-- Saga Coordinator writes ledger entry first → gets confirmation → updates Payment Status to COMPLETED
-
-**Q: Where exactly does idempotency check happen?**
-Before publishing to the queue. Check Redis first. If Redis misses, fall back to Read Replica. Never let a duplicate reach the queue.
-
-**Gap corrected:** Cache miss fallback should go to Read Replica, not Write Primary. Write Primary is for writes only.
-
-**Q: What if the balance check passes but the Payment Worker fails before writing to the ledger?**
-Saga Coordinator tracks state durably. If no confirmation from ledger within timeout, publishes compensation event. Reconciliation Consumer picks up stuck payments and retries or reverses.
-
-**Q: Why write to the ledger first before updating the payment table?**
-Ledger is the source of truth. If you write to the payment table first and the ledger write fails, payment table says money moved but no ledger entry exists — consistency violation. Ledger first guarantees the record exists before marking it complete.
+Write throughput: 2KB × 5,000 = 10MB/s at peak → well within sharded PostgreSQL
+```
 
 ---
 
-## 10 Second SLA Q&A
+## High-Level Architecture
 
-**Q: POST /payment goes through API → Queue → Worker → Saga → Ledger → Payment Table. How do you guarantee completion within 10 seconds?**
+```
+User (POST /payment with idempotency_key)
+  ↓
+Load Balancer
+  ↓
+API Gateway (auth, rate limiting)
+  ↓
+Payment Service
+  ├── Check idempotency_key → Redis (fast path)
+  │                        → PostgreSQL (fallback)
+  │   If key exists → return original payment response
+  ├── Write payment record (status=INITIATED) + outbox event — one transaction
+  └── Return 202 Accepted { paymentId, status: PENDING }
 
-Answer: Return 202 Accepted immediately after publishing to SQS. Client polls GET /payment/{id}/status or receives a webhook. The 10 second SLA means the payment reaches COMPLETED status within 10 seconds — not that the HTTP response takes 10 seconds.
+Outbox Publisher (polls outbox)
+  ↓
+Payment Queue (SQS)
+  ↓
+Saga Coordinator (Payment Worker)
+  ↓
+  Step 1: Debit sender → Ledger Service
+  Step 2: Call Payment Gateway (idempotency_key = paymentId)
+  Step 3: Credit recipient → Ledger Service
+  Step 4: Update payment status → SUCCEEDED
+  Write status + outbox event — one transaction
+  ↓
+Outbox Publisher
+  ↓
+SNS
+  ├── Notification SQS → Notification Service (email/SMS/push)
+  └── Audit SQS → Audit Service
 
-Two notification approaches:
-- Polling: client calls GET /payment/status every second
-- Webhook: system calls client callback URL when complete
-
-Scale Payment Workers horizontally based on SQS queue depth to keep processing time within budget.
+User (GET /payment/{paymentId}) → Payment Service → PostgreSQL Read Replica
+```
 
 ---
 
-## Vault Core Comparison
+## Idempotency — Three Boundaries
 
-Traditional architecture: Payment Platform → Ledger System (two separate services)
+**Boundary 1: Client → Payment Service**
 
-Vault Core: Smart Contract → Vault Core Ledger (one system)
+The client generates a UUID idempotency key and sends it with every request. If the same key arrives twice, the Payment Service returns the original payment response — no duplicate record created.
 
-- Smart contracts written in Python define the payment rules
-- Vault Core executes the smart contract and writes atomic postings to the immutable ledger
-- Business logic lives in the smart contract, not in a payment worker or saga coordinator
-- Streaming Ledger publishes events downstream
+The idempotency key must come from the CLIENT, not be generated by the system. If the system generates the transaction_id, a retry arrives with no key and slips through.
 
-> "Vault Core removes the need for a separate payment orchestration layer. The smart contract defines the business rules and Vault Core guarantees atomic posting to the ledger."
+```
+POST /payment
+Idempotency-Key: uuid-generated-by-client
+{ "to": "account-xyz", "amount": 50.00 }
+```
+
+**Boundary 2: Worker → Payment Gateway**
+
+The Worker sends the paymentId as the idempotency key to the Gateway API. If the Worker crashes after the Gateway processes the payment but before updating the database, the queue redelivers. The Worker calls the Gateway again with the same paymentId. The Gateway returns the original result without charging again.
+
+```
+POST /gateway/charge
+Idempotency-Key: pay-123
+{ "amount": 5000, "currency": "GBP" }
+```
+
+**Boundary 3: Worker → PostgreSQL**
+
+Before writing the payment result, check if a record for this paymentId already exists with a terminal status (SUCCEEDED/FAILED). If yes, skip.
 
 ---
 
-## Key Gaps Identified This Session
+## Payment State Machine
 
-1. Missed clarifying domestic vs international and payment SLA during requirements
-2. Back of envelope maths error — 4.3M instead of 432M
-3. Cache miss fallback must go to Read Replica, not Write Primary
-4. Fraud / AML / Sanctions checks missing from diagram — mandatory in a real payment platform
-5. Rail connectors missing — Faster Payments, CHAPS, BACS, SWIFT
-6. Payment state machine should have named states: CREATED → VALIDATED → FUNDS_RESERVED → SUBMITTED → SETTLED
-7. Fail closed on fraud provider unavailability — reject if provider is down, do not proceed
+```
+INITIATED → PENDING → PROCESSING → SUCCEEDED
+                                  → FAILED → (retry) → SUCCEEDED
+                                                      → DLQ
+                                  → REFUNDED
+```
+
+| State | Meaning |
+|---|---|
+| INITIATED | Payment record written to DB, queued for processing |
+| PENDING | Worker picked up the message, starting Saga |
+| PROCESSING | Saga in progress — Gateway call in flight |
+| SUCCEEDED | All Saga steps completed, money moved |
+| FAILED | Saga failed after retries exhausted |
+| REFUNDED | Compensating transaction completed, money returned |
+
+---
+
+## Saga Orchestrator — Cross-Service Coordination
+
+The Saga Coordinator (Payment Worker) is the single source of truth for payment state. It orchestrates each step and knows which compensating transaction to execute on failure.
+
+```
+Step 1: Debit sender account (Ledger Service)
+Step 2: Charge Payment Gateway (money moves)
+Step 3: Credit recipient account (Ledger Service)
+Step 4: Mark payment SUCCEEDED + publish completion event
+
+Failure at Step 2 → compensate Step 1: reverse debit, refund sender
+Failure at Step 3 → compensate Steps 2 and 1: reverse Gateway charge, reverse debit
+```
+
+Use **orchestration not choreography** — a central coordinator gives a clear view of payment state at every point. Choreography is harder to reason about and debug for financial flows.
+
+---
+
+## Outbox Pattern — Two Places
+
+**Place 1: Payment Service → Worker queue**
+
+Write the payment record (INITIATED) and outbox event atomically. Publisher publishes to queue. Crash between DB write and queue publish — event stays in outbox, retried.
+
+```sql
+BEGIN TRANSACTION
+  INSERT INTO payments (payment_id, status, idempotency_key, ...)
+  INSERT INTO outbox (event_type, payload)
+COMMIT
+```
+
+**Place 2: Saga Coordinator → SNS (after payment completes)**
+
+Write the final status (SUCCEEDED or FAILED) and completion outbox event atomically. Publisher fans out to SNS. Crash between DB update and SNS publish — notification is not lost.
+
+```sql
+BEGIN TRANSACTION
+  UPDATE payments SET status = 'SUCCEEDED' WHERE payment_id = ?
+  INSERT INTO outbox (event_type, payload)
+COMMIT
+```
+
+**The rule:** any time you write to a database AND need to publish an event, use the Outbox. Otherwise one of the two will be lost on a crash.
+
+---
+
+## Payment Gateway — Failure Handling
+
+| Scenario | Handling |
+|---|---|
+| Gateway timeout | Retry with exponential backoff + circuit breaker |
+| Gateway returns declined | Mark FAILED, notify user, no retry |
+| Gateway processes payment, Worker crashes before DB update | Queue redelivers, Gateway idempotency key prevents double charge |
+| Gateway down (circuit breaker open) | Fail fast, mark FAILED, DLQ for manual redrive |
+| Retries exhausted | DLQ, alert on-call |
+
+---
+
+## GET /payment/{id}
+
+The user receives a paymentId in the 202 response and polls for status:
+
+```json
+{
+  "paymentId": "pay-123",
+  "status": "PROCESSING",
+  "amount": 50.00,
+  "currency": "GBP",
+  "createdAt": "2026-07-17T14:00:00Z"
+}
+```
+
+Reads from PostgreSQL Read Replica. User can also receive push/email/SMS notification on terminal state.
+
+---
+
+## Observability
+
+| Signal | Why it matters |
+|---|---|
+| **Payment success rate** | Primary business metric — 1% drop = revenue loss. Alert immediately. |
+| Payment failure rate by reason | Gateway timeout vs declined vs retry exhausted — different root causes |
+| End-to-end payment latency | 202 received to SUCCEEDED — p50/p95/p99 |
+| Gateway latency and error rate | Is the external provider degraded? |
+| Circuit breaker state | Open = Gateway unreachable, all payments failing |
+| DLQ depth > 0 | Unrecoverable failures needing manual investigation |
+| Retry rate | High = Gateway instability |
+| Outbox depth | Unpublished events accumulating = Publisher or SNS down |
+
+Structured logs: every entry includes payment_id, idempotency_key, status, step, trace_id.
+
+---
+
+## Trade-offs
+
+| Decision | Why | Alternative |
+|---|---|---|
+| 202 Accepted pattern | Payment rails take time, do not block the user | Synchronous — user waits 30 seconds |
+| Outbox in two places | No event loss at either DB write + publish boundary | Direct publish — event lost on crash |
+| Saga orchestration over choreography | Central coordinator, clear payment state view | Choreography — harder to debug, unclear ownership |
+| Idempotency key from client | System-generated key cannot deduplicate client retries | System-generated — retries slip through |
+| Gateway idempotency key = paymentId | Prevents double charge on Worker retry | No Gateway key — money moves twice on retry |
+| Circuit breaker on Gateway | Fail fast during outage, do not block Workers | No circuit breaker — Workers pile up |
+| PostgreSQL over NoSQL | ACID, payment state machine needs strong consistency | DynamoDB — harder to enforce state transitions |
