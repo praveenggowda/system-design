@@ -23,12 +23,12 @@ Each folder contains a problem statement, architecture notes, and a diagram.
 | [News Feed](./news-feed/) | Fan-out on write vs read, Redis cache, pagination |
 | [Booking System](./booking-system/) | Distributed locking, idempotency, seat reservation, race conditions |
 
-## Patterns
+## Reference
 
-| Resource | Topics |
+| Guide | Topics |
 |---|---|
-| [Pattern Library](./interview-prep/system-design-pattern-library.md) | Common patterns with when to use and trade-offs |
-| [Banking Concepts](./interview-prep/banking-concepts-qa.md) | Double-entry, idempotency, Saga, event sourcing, CQRS, outbox, CAP, API design, observability |
+| [System Design Patterns](./interview-prep/system-design-pattern-library.md) | Common patterns with when to use and trade-offs |
+| [Banking and Fintech Concepts](./interview-prep/banking-concepts-qa.md) | Double-entry, idempotency, Saga, event sourcing, CQRS, outbox, CAP, API design, observability |
 
 ## All Topics
 
