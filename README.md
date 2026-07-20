@@ -23,6 +23,7 @@ Each folder contains a problem statement, architecture notes, and a diagram.
 | [News Feed](./news-feed/) | Fan-out on write vs read, Redis cache, pagination |
 | [Real-Time Board](./real-time-board/) | WebSockets, Redis Pub/Sub, optimistic locking, Outbox, write-through cache, per-item cache invalidation |
 | [Transaction Processing](./transaction-processing/) | Double-entry bookkeeping, idempotency, optimistic locking, Outbox, Saga for cross-shard transfers, two ingestion paths |
+| [Search System](./search-system/) | CDC, Kafka, Elasticsearch, document-level permissions, idempotent indexing, query-level cache |
 | [Booking System](./booking-system/) | Distributed locking, idempotency, seat reservation, race conditions |
 
 ## Reference
