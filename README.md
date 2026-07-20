@@ -21,6 +21,8 @@ Each folder contains a problem statement, architecture notes, and a diagram.
 | [URL Shortener](./url-shortener/) | DynamoDB, Redis LRU cache, Base62 encoding, redirect flow |
 | [Chat System](./chat-system/) | WebSocket, Redis Pub/Sub, multi-server routing, PostgreSQL, Push Notifications |
 | [News Feed](./news-feed/) | Fan-out on write vs read, Redis cache, pagination |
+| [Real-Time Board](./real-time-board/) | WebSockets, Redis Pub/Sub, optimistic locking, Outbox, write-through cache, per-item cache invalidation |
+| [Transaction Processing](./transaction-processing/) | Double-entry bookkeeping, idempotency, optimistic locking, Outbox, Saga for cross-shard transfers, two ingestion paths |
 | [Booking System](./booking-system/) | Distributed locking, idempotency, seat reservation, race conditions |
 
 ## Reference
